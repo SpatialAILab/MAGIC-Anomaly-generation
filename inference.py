@@ -4,11 +4,35 @@ from PIL import Image
 from magic_ddim import DDIMScheduler
 from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion_inpaint_magic import \
     StableDiffusionInpaintPipeline_magic
+import glob
+from diffusers.configuration_utils import FrozenDict   
+from torchvision import transforms
 
+# Fixed resolution (same as training: 512)
+RESOLUTION = 512
+
+# Resize + CenterCrop (same as training)
+image_resize_center_crop = transforms.Compose(
+    [
+        transforms.Resize(RESOLUTION, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(RESOLUTION),
+    ]
+)
+mask_resize_center_crop = transforms.Compose(
+    [
+        transforms.Resize(RESOLUTION, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(RESOLUTION),
+    ]
+)
+
+# -------------------------------------------------------------------------
+# 1) argument parser + miscellany
+# -------------------------------------------------------------------------
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="Inference-time mask-alignment augmentation.")
+    # ───────── Keep existing arguments ─────────
     parser.add_argument("--defect_json", required=True)
     parser.add_argument("--match_json",  required=True)
     parser.add_argument("--model_ckpt_root", required=True)
@@ -20,14 +44,69 @@ def parse_args():
     parser.add_argument("--anomaly_strength_min", type=float, default=0.0)
     parser.add_argument("--anomaly_strength_max", type=float, default=0.0)
     parser.add_argument("--anomaly_stop_step", type=int, default=999999)
+    parser.add_argument("--eta_mask_stop_step", type=int, default=999999)
     parser.add_argument("--normal_masks", default="./normal_masks")
     parser.add_argument("--mask_dir",    default="./Aug_mask_3_shot")
     parser.add_argument("--base_dir",    default="./mvtecad")
     parser.add_argument("--CAMA",        action="store_true")
     parser.add_argument("--use_random_mask", action="store_true")
-    parser.add_argument("--dataset_type", choices=["mvtec_3d", "mvtec"],
+    parser.add_argument("--dataset_type", choices=["mvtec_3d", "mvtec","visa","DAGM"],
                         default="mvtec_3d",
                         help="mvtec_3d: MVTEC-3D Anomaly, mvtec: MVTEC-AD 2-D")
+    parser.add_argument("--eta", type=float, default=0.0,
+                        help="DDIM eta (0~1). Used only by the DDIM scheduler; ignored by other schedulers.")
+    parser.add_argument("--eta_mask_max", type=float, default=0.0,
+                        help="Upper bound of eta inside the mask (when a schedule is used).")
+    parser.add_argument("--eta_mask_min", type=float, default=0.0,
+                        help="Lower bound of eta inside the mask (when a schedule is used).")
+
+    # ───────── NEW: eta_mask scheduler/guard hypers (passed into DDIM) ─────────
+    parser.add_argument("--eta_mask_use_schedule", action="store_true",
+                        help="If True, DDIM uses an internal step schedule (eta_mask arguments are ignored).")
+    parser.add_argument("--eta_mask_schedule",
+                        choices=["constant","linear_down","linear_up",
+                                 "cosine_down","cosine_up",
+                                 "poly_down","poly_up",
+                                 "exp_down","exp_up",
+                                 "sigmoid_down","sigmoid_up"],
+                        default="constant")
+    parser.add_argument("--eta_mask_power", type=float, default=2.0,
+                        help="Exponent p for polynomial schedule.")
+    parser.add_argument("--eta_mask_exp_k", type=float, default=3.0,
+                        help="Constant k for exponential schedule.")
+    parser.add_argument("--eta_mask_sigmoid_k", type=float, default=8.0,
+                        help="Slope k for sigmoid schedule.")
+    parser.add_argument("--eta_mask_segmented", action="store_true",
+                    help="Remap the schedule to s∈[0,1] only in the positive (allowed) region (segment start=max, end=0).")
+    parser.add_argument("--eta_mask_guard",
+                        choices=["none","clip_to_crit","zero_before_neg"],
+                        default="none",
+                        help="Guard mode for critical value.")
+    parser.add_argument("--eta_mask_guard_margin", type=float, default=0.99,
+                        help="Margin relative to the critical value (e.g., 0.99).")
+
+    # ───────── Existing CFG scalar arguments (keep defaults) ─────────
+    parser.add_argument("--guidance_scale_inside", type=float, default=None,
+                        help="Guidance scale inside the mask (if not set, use pipeline global guidance_scale).")
+    parser.add_argument("--guidance_scale_outside", type=float, default=None,
+                        help="Guidance scale outside the mask (if not set, use pipeline global guidance_scale).")
+
+    # ───────── NEW: guidance_scale_inside scheduling/sampling control ─────────
+    parser.add_argument("--gsi_use_schedule", action="store_true",
+                        help="If True, use a step-wise schedule for guidance_scale_inside (max→min).")
+    parser.add_argument("--gsi_schedule",
+                        choices=["constant","linear","linear_down","cosine","cosine_down",
+                                 "poly","poly_down","exp","exp_down","sigmoid","sigmoid_down"],
+                        default="linear",
+                        help="When selected, produces a decreasing schedule from max to min.")
+    parser.add_argument("--gsi_min", type=float, default=None, help="Lower bound of guidance_scale_inside.")
+    parser.add_argument("--gsi_max", type=float, default=None, help="Upper bound of guidance_scale_inside.")
+    parser.add_argument("--gsi_power", type=float, default=2.0, help="Exponent for polynomial schedule.")
+    parser.add_argument("--gsi_exp_k", type=float, default=3.0, help="k for exponential schedule.")
+    parser.add_argument("--gsi_sigmoid_k", type=float, default=8.0, help="k for sigmoid schedule.")
+    parser.add_argument("--gsi_sample_per_step", action="store_true",
+                        help="When not using a schedule, sample per step from [gsi_min, gsi_max].")
+
     return parser.parse_args()
 
 args = parse_args()
@@ -63,7 +142,15 @@ def monkey_patch_encode_prompt(pipe):
 
 
 def inpaint(pipe, image, prompt, mask=None, n_samples=4, device="cuda",
-            blur_factor=0, anomaly_strength=0.0, anomaly_stop_step=999999):
+            blur_factor=0,
+            anomaly_strength=0.0, anomaly_stop_step=999999, eta_mask_stop_step=999999,
+            eta=0.0, eta_mask=0.0,
+            guidance_scale_inside=None, guidance_scale_outside=None,
+            # NEW: pass inside schedule/sampling options
+            gsi_use_schedule=False, gsi_schedule="linear",
+            gsi_min=None, gsi_max=None,
+            gsi_power=2.0, gsi_exp_k=3.0, gsi_sigmoid_k=8.0,
+            gsi_sample_per_step=False):
     from PIL import Image as PilImage
     if isinstance(image, str):
         image_pil = PilImage.open(image).convert("RGB")
@@ -73,11 +160,35 @@ def inpaint(pipe, image, prompt, mask=None, n_samples=4, device="cuda",
         mask_pil = PilImage.open(mask).convert("RGB")
     else:
         mask_pil = mask.convert("RGB") if mask.mode != "RGB" else mask
+
+    # Apply blur (if already implemented in the project)
     mask_pil = pipe.mask_processor.blur(mask_pil, blur_factor=blur_factor)
+
     return pipe(
-        prompt=[prompt]*n_samples, image=image_pil, mask_image=mask_pil,
-        anomaly_strength=anomaly_strength, anomaly_stop_step=anomaly_stop_step,
-        use_random_mask=args.use_random_mask).images
+        prompt=[prompt]*n_samples,
+        image=image_pil,
+        mask_image=mask_pil,
+        anomaly_strength=anomaly_strength,
+        anomaly_stop_step=anomaly_stop_step,
+        eta_mask_stop_step=eta_mask_stop_step,
+        use_random_mask=args.use_random_mask,
+        eta=eta,
+        eta_mask=eta_mask,
+
+        # Existing/NEW arguments
+        guidance_scale_inside=guidance_scale_inside,
+        guidance_scale_outside=guidance_scale_outside,
+
+        # NEW: inside schedule/sampling parameters
+        gsi_use_schedule=gsi_use_schedule,
+        gsi_schedule=gsi_schedule,
+        guidance_scale_inside_min=gsi_min,
+        guidance_scale_inside_max=gsi_max,
+        gsi_power=gsi_power,
+        gsi_exp_k=gsi_exp_k,
+        gsi_sigmoid_k=gsi_sigmoid_k,
+        gsi_sample_per_step=gsi_sample_per_step,
+    ).images
 
 
 def get_random_image(img_dir):
@@ -92,12 +203,12 @@ def load_object_mask(category, normal_img_path, normal_masks_dir):
     cat_dir = os.path.join(normal_masks_dir, category)
     base = os.path.splitext(os.path.basename(normal_img_path))[0]
 
-    # Candidate directories to search first
     cand_dirs = [
         os.path.join(cat_dir, "train", "masks"),
         os.path.join(cat_dir, "masks"),
         cat_dir,
     ]
+
     candidates = []
     for d in cand_dirs:
         if not os.path.isdir(d):
@@ -106,8 +217,9 @@ def load_object_mask(category, normal_img_path, normal_masks_dir):
         candidates.extend(sorted(glob.glob(os.path.join(d, f"{base}_mask_*.png"))))
         candidates.append(os.path.join(d, f"{base}.png"))
         candidates.append(os.path.join(d, "mask.png"))
+    if not candidates:
+        print(f"[load_object_mask] No candidate mask files found for: {normal_img_path}")
 
-    # Remove duplicates and try only existing paths
     seen = set()
     ordered_paths = []
     for p in candidates:
@@ -124,11 +236,6 @@ def load_object_mask(category, normal_img_path, normal_masks_dir):
 
 def debug_save_masks(original_mask_bin, min_x, min_y, max_x, max_y,
                      shifted_mask_bin, debug_save_path):
-    """
-    Save side-by-side view:
-      • left  = original mask (white) with red bbox
-      • right = shifted / aligned mask
-    """
     H, W = original_mask_bin.shape
     left = np.zeros((H, W, 3), np.uint8)
     left[original_mask_bin > 0] = (255, 255, 255)
@@ -168,6 +275,7 @@ def CAMA(
     for it in match_data.get(category, {}).get(defect_class, []):
         if it["normal_img"] != base_normal:
             continue
+        # best_x and best_y in JSON are already based on 512x512, so use as-is
         by_defect.setdefault(it["defect_img"], []).append((it["best_x"], it["best_y"]))
 
     if not by_defect:
@@ -181,6 +289,7 @@ def CAMA(
 
     # ───────── ② Randomly choose one defect_img ─────────
     chosen_defect, coords_all = random.choice(list(by_defect.items()))
+    # coords_all: [(best_x, best_y), …]
 
     # ───────── ③ Extract components ─────────
     n_lbl, lbl_map, stats, _ = cv2.connectedComponentsWithStats(code_mask_bin, 8)
@@ -195,11 +304,11 @@ def CAMA(
     def rand_point_inside(mask):
         ys, xs = np.where(mask > 0)
         if ys.size == 0:
-            # If obj_mask is empty, sample from the whole image
+            # If obj_mask is empty, sample from the whole image (already in 512 coordinates)
             return random.randint(0, W - 1), random.randint(0, H - 1)
         idx = random.randrange(ys.size)
-        # Return in (x, y) order consistently
-        return int(xs[idx] * 480.0 / W), int(ys[idx] * 480.0 / H)
+        # Coordinates are also already in 512 coordinates
+        return int(xs[idx]), int(ys[idx])
 
     if n_coords >= n_comp:
         coords = random.sample(coords_all, n_comp)
@@ -214,9 +323,10 @@ def CAMA(
     target_pairs = list(zip(comps, coords))
 
     shifted = np.zeros_like(code_mask_bin, np.uint8)
-    for lbl, (best_x_480, best_y_480) in target_pairs:
-        best_x = int(best_x_480 * W / 480.0)
-        best_y = int(best_y_480 * H / 480.0)
+    for lbl, (best_x, best_y) in target_pairs:
+        # Both JSON and random coordinates are in 512-based coordinates, so use them directly
+        best_x = int(round(best_x))
+        best_y = int(round(best_y))
 
         # If the component already contains the best point, keep it as is
         if 0 <= best_x < W and 0 <= best_y < H and code_mask_bin[best_y, best_x]:
@@ -257,36 +367,34 @@ def CAMA(
 
 
 
-
 def main():
     with open(args.defect_json, "r", encoding="utf-8") as f:
         defect_data = json.load(f)
     with open(args.match_json, "r", encoding="utf-8") as f:
         match_data = json.load(f)
 
-    # ───────── Select default category list ─────────
     if args.dataset_type == "mvtec_3d":
         default_cats = ['bagel', 'cable_gland', 'carrot', 'cookie', 'dowel',
                         'foam', 'peach', 'potato', 'rope', 'tire']
-    else:  # mvtec
+    elif args.dataset_type == "visa":
+        default_cats = ['candle','capsules','cashew','chewinggum','fryum','macaroni1','macaroni2','pcb1','pcb2','pcb3','pcb4','pipe_fryum']
+    elif args.dataset_type == "DAGM":
+        default_cats = ['Class1','Class2','Class3','Class4','Class5','Class6','Class7','Class8','Class9','Class10']
+    else:
         default_cats = ['bottle', 'cable', 'capsule', 'carpet', 'grid',
                         'hazelnut', 'leather', 'metal_nut', 'pill', 'screw',
                         'tile', 'toothbrush', 'transistor', 'wood', 'zipper']
     categories = args.categories or default_cats
 
-
     for category in categories:
         device = "cuda"
 
-        # ───────── Path differences per dataset ─────────
         if args.dataset_type == "mvtec_3d":
             gt_path     = os.path.join(args.base_dir, category, "test")
-            normal_root = os.path.join(args.base_dir, category,
-                                       "train", "good", "rgb")
-        else:  # mvtec
+            normal_root = os.path.join(args.base_dir, category, "train", "good", "rgb")
+        else:
             gt_path     = os.path.join(args.base_dir, category, "ground_truth")
-            normal_root = os.path.join(args.base_dir, category,
-                                       "train", "good")
+            normal_root = os.path.join(args.base_dir, category, "train", "good")
 
         if not os.path.exists(gt_path):
             print(f"[WARN] ground_truth path not found: {gt_path}")
@@ -303,24 +411,42 @@ def main():
                 print(f"[WARN] {defect_class} not in defect_json → skip")
                 continue
             class_val = defect_data[category][defect_class]
-            print(f"Category={category}, Defect={defect_class}, "
-                  f"class_val={class_val}")
+            print(f"Category={category}, Defect={defect_class}, class_val={class_val}")
 
             mask_root = os.path.join(args.mask_dir, category, defect_class)
             if not os.path.exists(mask_root):
                 print(f"[WARN] {mask_root} not found → skip")
                 continue
 
-            ckpt_root = os.path.join(args.model_ckpt_root,
-                                     category, defect_class)
+            ckpt_root = os.path.join(args.model_ckpt_root, category, defect_class)
             if not os.path.exists(ckpt_root):
                 print(f"[WARN] checkpoint absent: {ckpt_root} → skip")
                 continue
 
             pipe = StableDiffusionInpaintPipeline_dynamic.from_pretrained(
                 ckpt_root, torch_dtype=torch.float16)
-            pipe.scheduler = DDIMScheduler.from_pretrained(
-                args.ddim_scheduler_root)
+            # --- Load DDIM scheduler
+            pipe.scheduler = DDIMScheduler.from_pretrained(args.ddim_scheduler_root)
+
+            # --- ★ Inject eta_mask schedule/guard hyperparameters from parser into DDIM config
+            sched = pipe.scheduler
+            new_cfg = dict(sched.config)
+            new_cfg.update({
+                "eta_mask_use_schedule": bool(args.eta_mask_use_schedule),
+                "eta_mask_schedule": args.eta_mask_schedule,
+                "eta_mask_min": float(args.eta_mask_min),
+                "eta_mask_max": float(args.eta_mask_max),
+                "eta_mask_power": float(args.eta_mask_power),
+                "eta_mask_exp_k": float(args.eta_mask_exp_k),
+                "eta_mask_sigmoid_k": float(args.eta_mask_sigmoid_k),
+                "eta_mask_guard": args.eta_mask_guard,
+                "eta_mask_guard_margin": float(args.eta_mask_guard_margin),
+                "eta_mask_segmented": bool(args.eta_mask_segmented),
+                # When schedule is on, still respect stop step by passing it to DDIM
+                "eta_mask_stop_step": int(args.eta_mask_stop_step),
+            })
+            sched._internal_dict = FrozenDict(new_cfg)
+
             pipe.text_noise_scale = args.text_noise_scale
             monkey_patch_encode_prompt(pipe)
             pipe.to(device)
@@ -328,43 +454,51 @@ def main():
             mask_imgs = sorted(
                 (os.path.join(mask_root, f) for f in os.listdir(mask_root)
                  if f.lower().endswith((".png", ".jpg", ".jpeg"))),
-                key=lambda x: extract_number_from_filename(
-                    os.path.basename(x)))
+                key=lambda x: extract_number_from_filename(os.path.basename(x)))
 
             suffix = (f"noise_{args.text_noise_scale}_"
-                      f"anomaly_{args.anomaly_strength_min}_"
-                      f"{args.anomaly_strength_max}_"
-                      f"dynamic_{args.anomaly_stop_step}_"
+                      f"guidance_scale_{args.gsi_min}_{args.gsi_max}_"
                       + ("align" if args.CAMA else "no_align"))
-            save_root = os.path.join(args.output_name, suffix,
-                                     category, defect_class)
-            img_dir  = os.makedirs(os.path.join(save_root, "image"),
-                                   exist_ok=True) or \
-                       os.path.join(save_root, "image")
-            norm_dir = os.makedirs(os.path.join(save_root, "normal"),
-                                   exist_ok=True) or \
-                       os.path.join(save_root, "normal")
-            msk_dir  = os.makedirs(os.path.join(save_root, "masks"),
-                                   exist_ok=True) or \
-                       os.path.join(save_root, "masks")
-            dbg_dir  = os.makedirs(os.path.join(save_root, "debug_mask"),
-                                   exist_ok=True) or \
-                       os.path.join(save_root, "debug_mask")
+            save_root = os.path.join(args.output_name, suffix, category, defect_class)
+            img_dir  = os.makedirs(os.path.join(save_root, "image"), exist_ok=True) or os.path.join(save_root, "image")
+            norm_dir = os.makedirs(os.path.join(save_root, "normal"), exist_ok=True) or os.path.join(save_root, "normal")
+            msk_dir  = os.makedirs(os.path.join(save_root, "masks"), exist_ok=True) or os.path.join(save_root, "masks")
+            dbg_dir  = os.makedirs(os.path.join(save_root, "debug_mask"), exist_ok=True) or os.path.join(save_root, "debug_mask")
 
             for idx, mask_path in enumerate(mask_imgs):
+                # -----------------------------
+                # 1) normal image 512 resize + center crop
+                # -----------------------------
                 normal_img_path = get_random_image(normal_root)
-                normal_img = Image.open(normal_img_path)
-                mask_np = (np.array(Image.open(mask_path).convert("L")) > 127
-                           ).astype(np.uint8)
+                normal_img = Image.open(normal_img_path).convert("RGB")
+                normal_img = image_resize_center_crop(normal_img)
 
-                obj_mask = load_object_mask(category, normal_img_path,
-                                            args.normal_masks)
+                # -----------------------------
+                # 2) aug mask 512 resize + center crop
+                # -----------------------------
+                raw_mask_pil = Image.open(mask_path).convert("L")
+                raw_mask_pil = mask_resize_center_crop(raw_mask_pil)
+                mask_np = (np.array(raw_mask_pil) > 127).astype(np.uint8)
+
+                # -----------------------------
+                # 3) object mask 512 resize + center crop (for CAMA)
+                # -----------------------------
+                obj_mask = load_object_mask(category, normal_img_path, args.normal_masks)
                 if obj_mask is None:
                     obj_mask = np.ones_like(mask_np, np.uint8)
-                if obj_mask.shape != mask_np.shape:
-                    obj_mask = cv2.resize(obj_mask, mask_np.shape[::-1],
-                                          interpolation=cv2.INTER_NEAREST)
+                else:
+                    obj_mask_pil = Image.fromarray((obj_mask * 255).astype(np.uint8))
+                    obj_mask_pil = mask_resize_center_crop(obj_mask_pil)
+                    obj_mask = (np.array(obj_mask_pil) > 127).astype(np.uint8)
 
+                # If shapes still do not match, align them once more by resizing
+                if obj_mask.shape != mask_np.shape:
+                    obj_mask = cv2.resize(obj_mask, mask_np.shape[::-1], interpolation=cv2.INTER_NEAREST)
+                    obj_mask = (obj_mask > 0).astype(np.uint8)
+
+                # -----------------------------
+                # 4) CAMA
+                # -----------------------------
                 if args.CAMA:
                     final_mask, *_ = CAMA(
                         class_val, mask_np, obj_mask, normal_img_path,
@@ -374,21 +508,41 @@ def main():
                 else:
                     final_mask = mask_np
 
-                final_mask_pil = Image.fromarray(
-                    (final_mask * 255).astype(np.uint8))
+                final_mask_pil = Image.fromarray((final_mask * 255).astype(np.uint8))
 
-                a_strength = random.uniform(args.anomaly_strength_min,
-                                            args.anomaly_strength_max)
-                imgs = inpaint(pipe, normal_img,
-                               prompt="a photo of a sks defect",
-                               mask=final_mask_pil, n_samples=1, device=device,
-                               blur_factor=args.blur_factor,
-                               anomaly_strength=a_strength,
-                               anomaly_stop_step=args.anomaly_stop_step)
+                a_strength = random.uniform(args.anomaly_strength_min, args.anomaly_strength_max)
+                # NOTE: If schedule is on, eta_strength below is ignored inside DDIM (internal schedule is used)
+                eta_strength = random.uniform(args.eta_mask_min, args.eta_mask_max)
+
+                imgs = inpaint(
+                    pipe, normal_img,
+                    prompt="a photo of a sks defect",
+                    mask=final_mask_pil, n_samples=1, device=device,
+                    blur_factor=args.blur_factor,
+                    anomaly_strength=a_strength,
+                    anomaly_stop_step=args.anomaly_stop_step,
+                    eta_mask_stop_step=args.eta_mask_stop_step,
+                    eta=args.eta,
+                    eta_mask=eta_strength,
+
+                    guidance_scale_inside=(args.guidance_scale_inside if args.guidance_scale_inside is not None else 3.0),
+                    guidance_scale_outside=(args.guidance_scale_outside if args.guidance_scale_outside is not None else 7.5),
+
+                    # NEW: pass inside schedule/sampling options
+                    gsi_use_schedule=args.gsi_use_schedule,
+                    gsi_schedule=args.gsi_schedule,
+                    gsi_min=args.gsi_min,
+                    gsi_max=args.gsi_max,
+                    gsi_power=args.gsi_power,
+                    gsi_exp_k=args.gsi_exp_k,
+                    gsi_sigmoid_k=args.gsi_sigmoid_k,
+                    gsi_sample_per_step=args.gsi_sample_per_step,
+                )
 
                 out = f"{idx}.jpg"
                 imgs[0].save(os.path.join(img_dir,  out))
-                normal_img.save(os.path.join(norm_dir, out))
+                normal_img = normal_img.convert("RGB")
+                normal_img.save(os.path.join(norm_dir, out), format="JPEG")
                 final_mask_pil.convert("RGB").save(os.path.join(msk_dir, out))
                 print(f"Saved {out}")
 
